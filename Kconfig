@@ -1,0 +1,15 @@
+source "Kconfig.zephyr"
+
+menu "BLE HID Gamepad"
+
+config NFC_OOB_PAIRING
+	bool "Enable NFC OOB pairing"
+	depends on HAS_HW_NRF_NFCT
+	default y
+	select NFC_T2T_NRFXLIB
+	select NFC_NDEF
+	select NFC_NDEF_MSG
+	select NFC_NDEF_RECORD
+	select NFC_NDEF_LE_OOB_REC
+
+endmenu
