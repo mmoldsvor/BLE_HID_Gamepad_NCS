@@ -165,7 +165,7 @@ struct pairing_data_mitm
     unsigned int passkey;
 };
 
-struct k_timer my_timer;
+struct k_timer saadc_timer;
 const struct device *adc_dev;
 static struct k_work saadc_work;
 
@@ -186,7 +186,7 @@ K_MSGQ_DEFINE(mitm_queue,
               CONFIG_BT_HIDS_MAX_CLIENT_COUNT,
               4);
 
-static uint16_t saadc_buffer[BUFFER_SIZE];
+static int16_t saadc_buffer[BUFFER_SIZE];
 
 static void advertising_start(void)
 {
@@ -899,7 +899,7 @@ static int saadc_sample(void)
 {
 	int ret;
 	const struct adc_sequence sequence = {
-		.channels = BIT(ADC_CHANNEL_ID_0) | BIT(ADC_CHANNEL_ID_1) | BIT(ADC_CHANNEL_ID_2) | BIT(ADC_CHANNEL_ID_3),
+		.channels = 15,
 		.buffer = saadc_buffer,
 		.buffer_size = sizeof(saadc_buffer),
 		.resolution = ADC_RESOLUTION,
@@ -914,11 +914,8 @@ static int saadc_sample(void)
         printk("adc_read() failed with code %d\n", ret);
 	}
 
-	for (int i = 0; i < BUFFER_SIZE; i++)
-	{
-		printk("%d ", saadc_buffer[i]);
-	}
-	printk("\n");
+        gamepad_thumbstick_changed(0, saadc_buffer[0] >= 0 ? saadc_buffer[0] : 0 , saadc_buffer[1] >= 0 ? saadc_buffer[1] : 0);
+        gamepad_thumbstick_changed(1, saadc_buffer[2] >= 0 ? saadc_buffer[2] : 0 , saadc_buffer[3] >= 0 ? saadc_buffer[3] : 0);        
 
 	return ret;
 }
@@ -942,14 +939,14 @@ void configure_saadc(void) {
         printk("device_get_binding ADC_0 (=%s) failed\n", ADC_DEVICE_NAME);
     } 
 	
-	for (int i = 0; i < channels; i++)
+	for (int i = 0; i < 4; i++)
 	{
 		const struct adc_channel_cfg saadc_channel_cfg = {
 			.gain = ADC_GAIN,
 			.reference = ADC_REFERENCE,
 			.acquisition_time = ADC_ACQUISITION_TIME,
 			.channel_id = i,
-			.input_positive = saadc_inputs[i];
+			.input_positive = saadc_inputs[i]
 		};
 		
 		err = adc_channel_setup(adc_dev, &saadc_channel_cfg);
@@ -985,7 +982,7 @@ void main(void)
 
     k_work_init(&hids_buttons_work, buttons_handler);
     k_work_init(&hids_thumbstick_work, thumbstick_handler);
-	k_work_init(&saadc_work, saadc_handler)
+	k_work_init(&saadc_work, saadc_handler);
     k_work_init(&pairing_work, pairing_process);
 
     if (IS_ENABLED(CONFIG_SETTINGS))
@@ -1000,13 +997,13 @@ void main(void)
     {
         if (is_adv)
         {
-            dk_set_led(adv_status_led, (++blink_status) % 2);
+            dk_set_led(ADV_STATUS_LED, (++blink_status) % 2);
         }
         else
         {
-			dk_set_led_off(adv_status_led);
+			dk_set_led_off(ADV_STATUS_LED);
         }
-        k_sleep(k_msec(adv_led_blink_interval));
+        k_sleep(K_MSEC(ADV_LED_BLINK_INTERVAL));
         /* battery level simulation */
         bas_notify();
     }
