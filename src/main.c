@@ -31,9 +31,7 @@
 #define OUTPUT_REPORT_MAX_LEN 1
 #define OUTPUT_REPORT_BIT_MASK_CAPS_LOCK 0x02
 #define OUTPUT_REP_KEYS_REF_ID 1
-#define INPUT_REP_GAMEPAD_BUTTONS_REF_ID 1
-#define INPUT_REP_GAMEPAD_LEFT_STICK_REF_ID 2
-#define INPUT_REP_GAMEPAD_RIGHT_STICK_REF_ID 3
+#define INPUT_REP_GAMEPAD_REF_ID 1
 #define MODIFIER_KEY_POS 0
 #define SHIFT_KEY_CODE 0x02
 #define SCAN_CODE_POS 2
@@ -67,6 +65,7 @@
 
 #define INPUT_REPORT_GAMEPAD_BUTTONS_MAX_LEN 2
 #define INPUT_REPORT_GAMEPAD_THUMBSTICK_MAX_LEN 2
+#define INPUT_REPORT_GAMEPAD_MAX_LEN INPUT_REPORT_GAMEPAD_BUTTONS_MAX_LEN + INPUT_REPORT_GAMEPAD_THUMBSTICK_MAX_LEN + INPUT_REPORT_GAMEPAD_THUMBSTICK_MAX_LEN
 
 #define HIDS_STACK_SIZE 2048
 #define HIDS_PRIORITY 5
@@ -88,9 +87,7 @@ enum
  */
 enum
 {
-    INPUT_REP_GAMEPAD_BUTTONS_IDX = 0,
-    INPUT_REP_GAMEPAD_LEFT_STICK_IDX,
-    INPUT_REP_GAMEPAD_RIGHT_STICK_IDX
+    INPUT_REP_GAMEPAD_IDX = 0
 };
 
 /* HIDS instance. */
@@ -122,44 +119,37 @@ static struct conn_mode
     struct bt_conn *conn;
 } conn_mode[CONFIG_BT_HIDS_MAX_CLIENT_COUNT];
 
-static struct data_to_send_thumbsticks
-{
-    bool left;
-    bool right;
-} data_to_send_thumbstick;
-
-static volatile bool data_to_send_buttons;
-static struct k_work hids_work;
-
-K_THREAD_STACK_DEFINE(hids_stack, HIDS_STACK_SIZE);
-
-struct k_work_q hids_work_q;
-
-typedef enum
-{
-	BUTTONS,
-	LEFT_THUMBSTICK,
-	RIGHT_THUMBSTICK
-} element_type;
-
-typedef struct
-{
-    element_type element;
-    uint8_t element_state[2];
-} gamepad_element_state;
-
 typedef struct
 {
     uint8_t horizontal;
     uint8_t vertical;
 } thumbstick_state;
 
+typedef struct 
+{
+    thumbstick_state left;
+    thumbstick_state right;
+} thumbstick_collection;
+
+typedef struct
+{
+    uint8_t first;
+    uint8_t second;
+} button_collection;
+
+typedef struct
+{
+    button_collection buttons;
+    thumbstick_collection thumbsticks;
+} gamepad_event_state;
+
 static struct gamepad_state
 {
-    bool buttons[16];
+    uint32_t buttons;
     thumbstick_state thumbsticks[2];
     bool thumbstick_temp_buttons[4];
 } hid_gamepad_state;
+
 
 static struct k_work pairing_work;
 struct pairing_data_mitm
@@ -168,15 +158,21 @@ struct pairing_data_mitm
     unsigned int passkey;
 };
 
-K_MSGQ_DEFINE(hids_queue,
-              sizeof(gamepad_element_state),
-              HIDS_QUEUE_SIZE,
-              4);
-
 K_MSGQ_DEFINE(mitm_queue,
               sizeof(struct pairing_data_mitm),
               CONFIG_BT_HIDS_MAX_CLIENT_COUNT,
               4);
+
+static volatile bool data_to_send;
+static struct k_work hids_work;
+
+K_MSGQ_DEFINE(hids_queue,
+              sizeof(gamepad_event_state),
+              HIDS_QUEUE_SIZE,
+              4);
+
+K_THREAD_STACK_DEFINE(hids_stack, HIDS_STACK_SIZE);
+struct k_work_q hids_work_q;
 
 static void advertising_start(void)
 {
@@ -427,7 +423,6 @@ static void hid_init(void)
         0x25, 0x01,       //     LOGICAL_MAXIMUM (1)
         0x81, 0x02,       //     INPUT (Data,Var,Abs)
         0xc0,             //   END_COLLECTION
-        0x85, 0x02,       //   REPORT_ID (2)
         0x05, 0x01,       //   USAGE_PAGE (Generic Desktop)
         0x09, 0x01,       //   USAGE (Pointer)
         0xa1, 0x00,       //   COLLECTION (Physical)
@@ -439,7 +434,6 @@ static void hid_init(void)
         0x26, 0xff, 0x00, //     LOGICAL_MAXIMUM (255)
         0x81, 0x02,       //     INPUT (Data,Var,Abs)
         0xc0,             //   END_COLLECTION
-        0x85, 0x03,       //   REPORT_ID (3)
         0x09, 0x01,       //   USAGE (Pointer)
         0xa1, 0x00,       //   COLLECTION (Physical)
         0x75, 0x08,       //     REPORT_SIZE (8)
@@ -460,19 +454,9 @@ static void hid_init(void)
     hids_init_obj.info.b_country_code = 0x00;
     hids_init_obj.info.flags = (BT_HIDS_REMOTE_WAKE | BT_HIDS_NORMALLY_CONNECTABLE);
 
-    hids_inp_rep = &hids_init_obj.inp_rep_group_init.reports[INPUT_REP_GAMEPAD_BUTTONS_IDX];
-    hids_inp_rep->size = INPUT_REPORT_GAMEPAD_BUTTONS_MAX_LEN;
-    hids_inp_rep->id = INPUT_REP_GAMEPAD_BUTTONS_REF_ID;
-    hids_init_obj.inp_rep_group_init.cnt++;
-
-    hids_inp_rep = &hids_init_obj.inp_rep_group_init.reports[INPUT_REP_GAMEPAD_LEFT_STICK_IDX];
-    hids_inp_rep->size = INPUT_REPORT_GAMEPAD_THUMBSTICK_MAX_LEN;
-    hids_inp_rep->id = INPUT_REP_GAMEPAD_LEFT_STICK_REF_ID;
-    hids_init_obj.inp_rep_group_init.cnt++;
-
-    hids_inp_rep = &hids_init_obj.inp_rep_group_init.reports[INPUT_REP_GAMEPAD_RIGHT_STICK_IDX];
-    hids_inp_rep->size = INPUT_REPORT_GAMEPAD_THUMBSTICK_MAX_LEN;
-    hids_inp_rep->id = INPUT_REP_GAMEPAD_RIGHT_STICK_REF_ID;
+    hids_inp_rep = &hids_init_obj.inp_rep_group_init.reports[INPUT_REP_GAMEPAD_IDX];
+    hids_inp_rep->size = INPUT_REPORT_GAMEPAD_MAX_LEN;
+    hids_inp_rep->id = INPUT_REP_GAMEPAD_REF_ID;
     hids_init_obj.inp_rep_group_init.cnt++;
 
     hids_outp_rep = &hids_init_obj.outp_rep_group_init.reports[OUTPUT_REP_KEYS_IDX];
@@ -583,44 +567,35 @@ static struct bt_conn_auth_cb conn_auth_callbacks = {
     .pairing_complete = pairing_complete,
     .pairing_failed = pairing_failed};
 
-static int gamepad_report_button_send(struct bt_conn *conn, uint8_t buttons1, uint8_t buttons2)
+static int gamepad_report_send(struct bt_conn *conn, gamepad_event_state state)
 {
     int err = 0;
-    uint8_t data[INPUT_REPORT_GAMEPAD_BUTTONS_MAX_LEN];
+    uint8_t data[INPUT_REPORT_GAMEPAD_MAX_LEN];
 
-    data[0] = buttons1;
-    data[1] = buttons2;
+    data[0] = state.buttons.first;
+    data[1] = state.buttons.second;
+    data[2] = state.thumbsticks.left.vertical;
+    data[3] = state.thumbsticks.left.horizontal;
+    data[4] = state.thumbsticks.right.vertical;
+    data[5] = state.thumbsticks.right.horizontal;
 
-    err = bt_hids_inp_rep_send(&hids_obj, conn, INPUT_REP_GAMEPAD_BUTTONS_IDX, data, sizeof(data), NULL);
-
-    return err;
-}
-
-static int gamepad_report_thumbstick_send(struct bt_conn *conn, uint8_t thumbstick, uint8_t vertical, uint8_t horizontal)
-{
-    int err = 0;
-    uint8_t data[INPUT_REPORT_GAMEPAD_THUMBSTICK_MAX_LEN];
-
-    data[0] = vertical;
-    data[1] = horizontal;
-
-    err = bt_hids_inp_rep_send(&hids_obj, conn, INPUT_REP_GAMEPAD_LEFT_STICK_IDX + thumbstick, data, sizeof(data), NULL);
+    err = bt_hids_inp_rep_send(&hids_obj, conn, INPUT_REP_GAMEPAD_IDX, data, sizeof(data), NULL);
     
     return err;
 }
 
-static int button_report_send(uint8_t buttons1, uint8_t buttons2)
+static int report_send(gamepad_event_state state)
 {
     for (size_t i = 0; i < CONFIG_BT_HIDS_MAX_CLIENT_COUNT; i++)
     {
         if (conn_mode[i].conn)
         {
             int err;
-            err = gamepad_report_button_send(conn_mode[i].conn, buttons1, buttons2);
+            err = gamepad_report_send(conn_mode[i].conn, state);
 
             if (err)
             {
-                printk("Button report send error: %d\n", err);
+                printk("Gamepad report send error: %d\n", err);
                 return err;
             }
         }
@@ -628,40 +603,18 @@ static int button_report_send(uint8_t buttons1, uint8_t buttons2)
     return 0;
 }
 
-static int thumbstick_report_send(uint8_t thumbstick, uint8_t vertical, uint8_t horizontal)
-{
-    for (size_t i = 0; i < CONFIG_BT_HIDS_MAX_CLIENT_COUNT; i++)
-    {
-        if (conn_mode[i].conn)
-        {
-            int err;
-            err = gamepad_report_thumbstick_send(conn_mode[i].conn, thumbstick, vertical, horizontal);
-
-            if (err)
-            {
-                printk("Thumbstick report send error: %d\n", err);
-                return err;
-            }
-        }
-    }
-    return 0;
-}
 
 static int gamepad_button_changed(uint8_t button, bool down)
 {
-    hid_gamepad_state.buttons[button] = down;
-    data_to_send_buttons = true;
+    hid_gamepad_state.buttons = (hid_gamepad_state.buttons & ~(1 << button)) | (down << button);
+    data_to_send = true;
 }
 
 static int gamepad_thumbstick_changed(uint8_t thumbstick, uint8_t horizontal, uint8_t vertical)
 {
     hid_gamepad_state.thumbsticks[thumbstick].horizontal = horizontal;
     hid_gamepad_state.thumbsticks[thumbstick].vertical = vertical;
-
-    if (thumbstick == 0)
-        data_to_send_thumbstick.left = true;
-    else if (thumbstick == 1)
-        data_to_send_thumbstick.right = true;
+    data_to_send = true;
 }
 
 static int gamepad_thumbstick_changed_temp(uint8_t thumbstick, uint8_t button, bool down)
@@ -683,26 +636,13 @@ static int gamepad_thumbstick_changed_temp(uint8_t thumbstick, uint8_t button, b
     gamepad_thumbstick_changed(thumbstick, horizontal, vertical);
 }
 
-static void element_handler(struct k_work *work)
+static void gamepad_event_handler(struct k_work *work)
 {
-    gamepad_element_state state;
+    gamepad_event_state state;
 
     while (!k_msgq_get(&hids_queue, &state, K_NO_WAIT))
     {
-		switch(state.element){
-			case BUTTONS: {
-				button_report_send(state.element_state[0], state.element_state[1]);				
-				break;
-			}
-			case LEFT_THUMBSTICK: {
-				thumbstick_report_send(0, state.element_state[0], state.element_state[1]);
-				break;
-			}
-			case RIGHT_THUMBSTICK: {
-				thumbstick_report_send(1, state.element_state[0], state.element_state[1]);
-				break;
-			}
-		}
+		report_send(state);
     }
 }
 
@@ -737,39 +677,33 @@ static void num_comp_reply(bool accept)
     }
 }
 
-static int add_to_queue(element_type element)
+static int add_to_queue(void)
 {
     int err;
 	
-	gamepad_element_state element_state = {};
-	element_state.element = element;
+	gamepad_event_state state = {};
 	
-	switch(element) {
-		case BUTTONS: {
-			for (int i = 0; i < 8; i++) {
-				element_state.element_state[0] += hid_gamepad_state.buttons[i] << i;
-				element_state.element_state[1] += hid_gamepad_state.buttons[i + 8] << i;
-			}
-			break;
-		}
-		case LEFT_THUMBSTICK: {
-			element_state.element_state[0] = hid_gamepad_state.thumbsticks[0].horizontal;
-			element_state.element_state[1] = hid_gamepad_state.thumbsticks[0].vertical;
-			break;
-		}
-		case RIGHT_THUMBSTICK: {
-			element_state.element_state[0] = hid_gamepad_state.thumbsticks[1].horizontal;
-			element_state.element_state[1] = hid_gamepad_state.thumbsticks[1].vertical;
-			break;
-		}
-	}
+    // Set button states
+    state.buttons.first = (uint8_t) hid_gamepad_state.buttons;
+    state.buttons.second = (uint8_t ) (hid_gamepad_state.buttons >> 8);
 
-    err = k_msgq_put(&hids_queue, &element_state, K_NO_WAIT);
+    state.thumbsticks.left.vertical = hid_gamepad_state.thumbsticks[0].vertical;
+    state.thumbsticks.left.horizontal = hid_gamepad_state.thumbsticks[0].horizontal;
+
+    state.thumbsticks.right.vertical = hid_gamepad_state.thumbsticks[1].vertical;
+    state.thumbsticks.right.horizontal = hid_gamepad_state.thumbsticks[1].horizontal;
+
+    err = k_msgq_put(&hids_queue, &state, K_NO_WAIT);
     if (err)
     {
         printk("No space in the queue for gamepad event\n");
         return err;
     }
+    if (k_msgq_num_used_get(&hids_queue) >= 1)
+    {
+        k_work_submit_to_queue(&hids_work_q, &hids_work);
+    }
+
     return 0;
 }
 
@@ -800,8 +734,7 @@ static void button_changed(uint32_t button_state, uint32_t has_changed)
         }
     }
 
-    data_to_send_thumbstick.left = false;
-	data_to_send_thumbstick.right = false;
+    data_to_send = false;
 
     for (int thumbstick = 0; thumbstick < 2; thumbstick++)
     {
@@ -814,8 +747,6 @@ static void button_changed(uint32_t button_state, uint32_t has_changed)
         if (has_changed & BUTTON_Y_MASK)
             gamepad_thumbstick_changed_temp(thumbstick, 3, (button_state & BUTTON_Y_MASK) != 0);
     }
-
-	data_to_send_buttons = false;
 
     if (has_changed & BUTTON_A_MASK)
     {
@@ -851,25 +782,8 @@ static void button_changed(uint32_t button_state, uint32_t has_changed)
         gamepad_button_changed(12, (button_state & BUTTON_UP_MASK) != 0);
     }
 
-    if (data_to_send_thumbstick.left)
-    {
-        add_to_queue(LEFT_THUMBSTICK);
-    } 
-    if (data_to_send_thumbstick.right)
-    {
-        add_to_queue(RIGHT_THUMBSTICK);
-    }
-    if (data_to_send_buttons)
-    {
-        add_to_queue(BUTTONS);
-    }
-
-    if (data_to_send_thumbstick.left || data_to_send_thumbstick.right || data_to_send_buttons) {
-        if (k_msgq_num_used_get(&hids_queue) >= 1)
-        {
-            err = k_work_submit_to_queue(&hids_work_q, &hids_work);
-        }
-    }
+    if (data_to_send)
+        add_to_queue();
 }
 
 static void configure_gpio(void)
@@ -928,7 +842,7 @@ void main(void)
 
     k_work_queue_start(&hids_work_q, hids_stack, K_THREAD_STACK_SIZEOF(hids_stack), HIDS_PRIORITY, NULL);
 
-    k_work_init(&hids_work, element_handler);
+    k_work_init(&hids_work, gamepad_event_handler);
     k_work_init(&pairing_work, pairing_process);
 
     if (IS_ENABLED(CONFIG_SETTINGS))
