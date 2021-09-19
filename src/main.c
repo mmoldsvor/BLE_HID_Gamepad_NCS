@@ -78,17 +78,8 @@
 #define ADC_REFERENCE ADC_REF_INTERNAL
 #define ADC_ACQUISITION_TIME ADC_ACQ_TIME(ADC_ACQ_TIME_MICROSECONDS, 10)
 
-#define ADC_1ST_CHANNEL_ID 0  
-#define ADC_1ST_CHANNEL_INPUT NRF_SAADC_INPUT_AIN0
-#define ADC_2ND_CHANNEL_ID 1
-#define ADC_2ND_CHANNEL_INPUT NRF_SAADC_INPUT_AIN1
-#define ADC_3RD_CHANNEL_ID 2  
-#define ADC_3RD_CHANNEL_INPUT NRF_SAADC_INPUT_AIN2
-#define ADC_4TH_CHANNEL_ID 3
-#define ADC_4TH_CHANNEL_INPUT NRF_SAADC_INPUT_AIN3
-
-#define TIMER_INTERVAL_MSEC 50
-#define BUFFER_SIZE 1
+#define SAADC_INTERVAL_MSEC 50
+#define BUFFER_SIZE 4
 
 /* OUT report internal indexes.
  *
@@ -176,6 +167,9 @@ struct pairing_data_mitm
 
 struct k_timer my_timer;
 const struct device *adc_dev;
+static struct k_work saadc_work;
+
+static nrf_saadc_input_t saadc_inputs[4] = {NRF_SAADC_INPUT_AIN0, NRF_SAADC_INPUT_AIN1, NRF_SAADC_INPUT_AIN2, NRF_SAADC_INPUT_AIN3};
 
 K_MSGQ_DEFINE(hids_buttons_queue,
               sizeof(buttons_state),
@@ -192,19 +186,7 @@ K_MSGQ_DEFINE(mitm_queue,
               CONFIG_BT_HIDS_MAX_CLIENT_COUNT,
               4);
 
-K_SEM_DEFINE(adc_sem, 0, 1);
-
-static const struct adc_channel_cfg m_1st_channel_cfg = {
-	.gain = ADC_GAIN,
-	.reference = ADC_REFERENCE,
-	.acquisition_time = ADC_ACQUISITION_TIME,
-	.channel_id = ADC_1ST_CHANNEL_ID,
-#if defined(CONFIG_ADC_CONFIGURABLE_INPUTS)
-	.input_positive = ADC_1ST_CHANNEL_INPUT,
-#endif
-};
-
-static uint16_t m_sample_buffer[BUFFER_SIZE];
+static uint16_t saadc_buffer[BUFFER_SIZE];
 
 static void advertising_start(void)
 {
@@ -913,31 +895,13 @@ static void bas_notify(void)
     bt_bas_set_battery_level(battery_level);
 }
 
-static int adc_sample(void)
+static int saadc_sample(void)
 {
 	int ret;
-	const struct adc_sequence sequence1 = {
-		.channels = BIT(ADC_1ST_CHANNEL_ID),
-		.buffer = m_sample_buffer,
-		.buffer_size = sizeof(m_sample_buffer),
-		.resolution = ADC_RESOLUTION,
-	};
-        const struct adc_sequence sequence2 = {
-		.channels = BIT(ADC_2ND_CHANNEL_ID),
-		.buffer = m_sample_buffer,
-		.buffer_size = sizeof(m_sample_buffer),
-		.resolution = ADC_RESOLUTION,
-	};
-        const struct adc_sequence sequence3 = {
-		.channels = BIT(ADC_3RD_CHANNEL_ID),
-		.buffer = m_sample_buffer,
-		.buffer_size = sizeof(m_sample_buffer),
-		.resolution = ADC_RESOLUTION,
-	};
-        const struct adc_sequence sequence4 = {
-		.channels = BIT(ADC_4TH_CHANNEL_ID),
-		.buffer = m_sample_buffer,
-		.buffer_size = sizeof(m_sample_buffer),
+	const struct adc_sequence sequence = {
+		.channels = BIT(ADC_CHANNEL_ID_0) | BIT(ADC_CHANNEL_ID_1) | BIT(ADC_CHANNEL_ID_2) | BIT(ADC_CHANNEL_ID_3),
+		.buffer = saadc_buffer,
+		.buffer_size = sizeof(saadc_buffer),
 		.resolution = ADC_RESOLUTION,
 	};
 
@@ -945,49 +909,53 @@ static int adc_sample(void)
 		return -1;
 	}
 
-	ret = adc_read(adc_dev, &sequence1);
+	ret = adc_read(adc_dev, &sequence);
 	if (ret) {
-            printk("adc_read() failed with code %d\n", ret);
-	}
-        ret = adc_read(adc_dev, &sequence2);
-	if (ret) {
-            printk("adc_read() failed with code %d\n", ret);
-	}
-        ret = adc_read(adc_dev, &sequence3);
-	if (ret) {
-            printk("adc_read() failed with code %d\n", ret);
-	}
-        ret = adc_read(adc_dev, &sequence4);
-	if (ret) {
-            printk("adc_read() failed with code %d\n", ret);
+        printk("adc_read() failed with code %d\n", ret);
 	}
 
-        gamepad_thumbstick_changed(0, m_sample_buffer[0], m_sample_buffer[1]);
-        gamepad_thumbstick_changed(1, m_sample_buffer[2], m_sample_buffer[3]);
-        add_to_thumbstick_queue(0);
+	for (int i = 0; i < BUFFER_SIZE; i++)
+	{
+		printk("%d ", saadc_buffer[i]);
+	}
+	printk("\n");
 
 	return ret;
 }
 
-void adc_sample_event(struct k_timer *timer_id){
-    k_sem_give(&adc_sem);
-    /*int err = adc_sample();
-    if (err) {
-        printk("Error in adc sampling: %d\n", err);
-    }*/
+static void saadc_handler(struct k_work *work) {
+    saadc_sample();
 }
 
-void configure_saadc(void){
-    k_timer_init(&my_timer, adc_sample_event, NULL);
-    k_timer_start(&my_timer, K_MSEC(TIMER_INTERVAL_MSEC), K_MSEC(TIMER_INTERVAL_MSEC));
+void adc_sample_event(struct k_timer *timer_id) {
+    k_work_submit(&saadc_work);
+}
+
+void configure_saadc(void) {
+    int err;
+	
+	k_timer_init(&saadc_timer, adc_sample_event, NULL);
+    k_timer_start(&saadc_timer, K_MSEC(SAADC_INTERVAL_MSEC), K_MSEC(SAADC_INTERVAL_MSEC));
 
     adc_dev = device_get_binding(ADC_DEVICE_NAME);
 	if (!adc_dev) {
         printk("device_get_binding ADC_0 (=%s) failed\n", ADC_DEVICE_NAME);
     } 
-    int err = adc_channel_setup(adc_dev, &m_1st_channel_cfg);
-    if (err) {
-	    printk("Error in adc setup: %d\n", err);
+	
+	for (int i = 0; i < channels; i++)
+	{
+		const struct adc_channel_cfg saadc_channel_cfg = {
+			.gain = ADC_GAIN,
+			.reference = ADC_REFERENCE,
+			.acquisition_time = ADC_ACQUISITION_TIME,
+			.channel_id = i,
+			.input_positive = saadc_inputs[i];
+		};
+		
+		err = adc_channel_setup(adc_dev, &saadc_channel_cfg);
+		if (err) {
+			printk("Error in adc channel %d setup: %d\n", i, err);
+		}
 	}
 }
 
@@ -1017,6 +985,7 @@ void main(void)
 
     k_work_init(&hids_buttons_work, buttons_handler);
     k_work_init(&hids_thumbstick_work, thumbstick_handler);
+	k_work_init(&saadc_work, saadc_handler)
     k_work_init(&pairing_work, pairing_process);
 
     if (IS_ENABLED(CONFIG_SETTINGS))
@@ -1029,19 +998,16 @@ void main(void)
 
     for (;;)
     {
-        //if (is_adv)
-        //{
-        //    dk_set_led(ADV_STATUS_LED, (++blink_status) % 2);
-        //}
-        //else
-        //{
-        //    dk_set_led_off(ADV_STATUS_LED);
-        //}
-        //k_sleep(K_MSEC(ADV_LED_BLINK_INTERVAL));
-        /* Battery level simulation */
-        //bas_notify();
-
-        k_sem_take(&adc_sem, K_MSEC(TIMER_INTERVAL_MSEC));
-        adc_sample();
+        if (is_adv)
+        {
+            dk_set_led(adv_status_led, (++blink_status) % 2);
+        }
+        else
+        {
+			dk_set_led_off(adv_status_led);
+        }
+        k_sleep(k_msec(adv_led_blink_interval));
+        /* battery level simulation */
+        bas_notify();
     }
 }
