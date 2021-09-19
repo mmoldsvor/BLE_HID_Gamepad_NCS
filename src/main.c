@@ -19,7 +19,6 @@
 #include <bluetooth/uuid.h>
 #include <bluetooth/gatt.h>
 
-#include <bluetooth/services/bas.h>
 #include <bluetooth/services/hids.h>
 #include <bluetooth/services/dis.h>
 #include <dk_buttons_and_leds.h>
@@ -32,21 +31,10 @@
 
 #define BASE_USB_HID_SPEC_VERSION 0x0101
 
-#define OUTPUT_REPORT_MAX_LEN 1
-#define OUTPUT_REPORT_BIT_MASK_CAPS_LOCK 0x02
-#define OUTPUT_REP_KEYS_REF_ID 1
-#define INPUT_REP_GAMEPAD_REF_ID 1
-#define MODIFIER_KEY_POS 0
-#define SHIFT_KEY_CODE 0x02
-#define SCAN_CODE_POS 2
-#define KEYS_MAX_LEN (INPUT_REPORT_KEYS_MAX_LEN - SCAN_CODE_POS)
-
 #define ADV_LED_BLINK_INTERVAL 1000
 
 #define ADV_STATUS_LED DK_LED1
 #define CON_STATUS_LED DK_LED2
-#define LED_CAPS_LOCK DK_LED3
-#define NFC_LED DK_LED4
 
 #define BUTTON_A_MASK DK_BTN4_MSK
 #define BUTTON_B_MASK DK_BTN2_MSK
@@ -67,12 +55,15 @@
 /* HIDs queue elements. */
 #define HIDS_QUEUE_SIZE 50
 
+#define INPUT_REP_GAMEPAD_REF_ID 1
+
 #define INPUT_REPORT_GAMEPAD_BUTTONS_MAX_LEN 2
 #define INPUT_REPORT_GAMEPAD_THUMBSTICK_MAX_LEN 2
 #define INPUT_REPORT_GAMEPAD_MAX_LEN INPUT_REPORT_GAMEPAD_BUTTONS_MAX_LEN + INPUT_REPORT_GAMEPAD_THUMBSTICK_MAX_LEN + INPUT_REPORT_GAMEPAD_THUMBSTICK_MAX_LEN
 
 #define HIDS_STACK_SIZE 2048
 #define HIDS_PRIORITY 5
+
 #define ADC_DEVICE_NAME DT_LABEL(DT_INST(0, nordic_nrf_saadc))
 #define ADC_RESOLUTION 8
 #define ADC_GAIN ADC_GAIN_1_6
@@ -82,21 +73,7 @@
 #define SAADC_INTERVAL_MSEC 50
 #define BUFFER_SIZE 4
 
-/* OUT report internal indexes.
- *
- * This is a position in internal report table and is not related to
- * report ID.
- */
-enum
-{
-    OUTPUT_REP_KEYS_IDX = 0
-};
-
-/* INPUT report internal indexes.
- *
- * This is a position in internal report table and is not related to
- * report ID.
- */
+// Position in internal report table
 enum
 {
     INPUT_REP_GAMEPAD_IDX = 0
@@ -104,7 +81,6 @@ enum
 
 /* HIDS instance. */
 BT_HIDS_DEF(hids_obj,
-            OUTPUT_REPORT_MAX_LEN,
             INPUT_REPORT_GAMEPAD_BUTTONS_MAX_LEN,
             INPUT_REPORT_GAMEPAD_THUMBSTICK_MAX_LEN,
             INPUT_REPORT_GAMEPAD_THUMBSTICK_MAX_LEN);
@@ -117,8 +93,7 @@ static const struct bt_data ad[] = {
                   (CONFIG_BT_DEVICE_APPEARANCE >> 8) & 0xff),
     BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
     BT_DATA_BYTES(BT_DATA_UUID16_ALL,
-                  0x12, 0x18,  /* HID Service */
-                  0x0f, 0x18), /* Battery Service */
+                  0x12, 0x18), /* HID Service */
 
 };
 
@@ -137,7 +112,7 @@ typedef struct
     uint8_t vertical;
 } thumbstick_state;
 
-typedef struct 
+typedef struct
 {
     thumbstick_state left;
     thumbstick_state right;
@@ -155,14 +130,6 @@ typedef struct
     thumbstick_collection thumbsticks;
 } gamepad_event_state;
 
-static struct gamepad_state
-{
-    uint32_t buttons;
-    thumbstick_state thumbsticks[2];
-    bool thumbstick_temp_buttons[4];
-} hid_gamepad_state;
-
-
 static struct k_work pairing_work;
 struct pairing_data_mitm
 {
@@ -170,11 +137,15 @@ struct pairing_data_mitm
     unsigned int passkey;
 };
 
-struct k_timer saadc_timer;
 const struct device *adc_dev;
+struct k_timer saadc_timer;
 static struct k_work saadc_work;
 
-static nrf_saadc_input_t saadc_inputs[4] = {NRF_SAADC_INPUT_AIN2, NRF_SAADC_INPUT_AIN3, NRF_SAADC_INPUT_AIN0, NRF_SAADC_INPUT_AIN1};
+static nrf_saadc_input_t saadc_inputs[4] = {
+    NRF_SAADC_INPUT_AIN2,  // Left thumbstick vertical
+    NRF_SAADC_INPUT_AIN3,  // Left thumbstick horizontal
+    NRF_SAADC_INPUT_AIN0,  // Right thumbstick vertical
+    NRF_SAADC_INPUT_AIN1}; // Right thumbstick horizontal
 
 K_MSGQ_DEFINE(mitm_queue,
               sizeof(struct pairing_data_mitm),
@@ -191,7 +162,14 @@ K_MSGQ_DEFINE(hids_queue,
 
 K_THREAD_STACK_DEFINE(hids_stack, HIDS_STACK_SIZE);
 struct k_work_q hids_work_q;
+
 static int16_t saadc_buffer[BUFFER_SIZE];
+
+static struct gamepad_state
+{
+    uint32_t buttons;
+    thumbstick_state thumbsticks[2];
+} hid_gamepad_state;
 
 static void advertising_start(void)
 {
@@ -342,89 +320,11 @@ static struct bt_conn_cb conn_callbacks = {
     .security_changed = security_changed,
 };
 
-static void caps_lock_handler(const struct bt_hids_rep *rep)
-{
-    uint8_t report_val = ((*rep->data) & OUTPUT_REPORT_BIT_MASK_CAPS_LOCK) ? 1 : 0;
-    dk_set_led(LED_CAPS_LOCK, report_val);
-}
-
-static void hids_outp_rep_handler(struct bt_hids_rep *rep,
-                                  struct bt_conn *conn,
-                                  bool write)
-{
-    char addr[BT_ADDR_LE_STR_LEN];
-
-    if (!write)
-    {
-        printk("Output report read\n");
-        return;
-    };
-
-    bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
-    printk("Output report has been received %s\n", addr);
-    caps_lock_handler(rep);
-}
-
-static void hids_boot_kb_outp_rep_handler(struct bt_hids_rep *rep,
-                                          struct bt_conn *conn,
-                                          bool write)
-{
-    char addr[BT_ADDR_LE_STR_LEN];
-
-    if (!write)
-    {
-        printk("Output report read\n");
-        return;
-    };
-
-    bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
-    printk("Boot Keyboard Output report has been received %s\n", addr);
-    caps_lock_handler(rep);
-}
-
-static void hids_pm_evt_handler(enum bt_hids_pm_evt evt,
-                                struct bt_conn *conn)
-{
-    char addr[BT_ADDR_LE_STR_LEN];
-    size_t i;
-
-    for (i = 0; i < CONFIG_BT_HIDS_MAX_CLIENT_COUNT; i++)
-    {
-        if (conn_mode[i].conn == conn)
-        {
-            break;
-        }
-    }
-
-    if (i >= CONFIG_BT_HIDS_MAX_CLIENT_COUNT)
-    {
-        printk("Cannot find connection handle when processing PM");
-        return;
-    }
-
-    bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
-
-    switch (evt)
-    {
-    case BT_HIDS_PM_EVT_BOOT_MODE_ENTERED:
-        printk("Boot mode entered %s\n", addr);
-        break;
-
-    case BT_HIDS_PM_EVT_REPORT_MODE_ENTERED:
-        printk("Report mode entered %s\n", addr);
-        break;
-
-    default:
-        break;
-    }
-}
-
 static void hid_init(void)
 {
     int err;
     struct bt_hids_init_param hids_init_obj = {0};
     struct bt_hids_inp_rep *hids_inp_rep;
-    struct bt_hids_outp_feat_rep *hids_outp_rep;
 
     static const uint8_t report_map[] = {
         0x05, 0x01,       // USAGE_PAGE (Generic Desktop)
@@ -477,16 +377,6 @@ static void hid_init(void)
     hids_inp_rep->size = INPUT_REPORT_GAMEPAD_MAX_LEN;
     hids_inp_rep->id = INPUT_REP_GAMEPAD_REF_ID;
     hids_init_obj.inp_rep_group_init.cnt++;
-
-    hids_outp_rep = &hids_init_obj.outp_rep_group_init.reports[OUTPUT_REP_KEYS_IDX];
-    hids_outp_rep->size = OUTPUT_REPORT_MAX_LEN;
-    hids_outp_rep->id = OUTPUT_REP_KEYS_REF_ID;
-    hids_outp_rep->handler = hids_outp_rep_handler;
-    hids_init_obj.outp_rep_group_init.cnt++;
-
-    hids_init_obj.is_kb = true;
-    hids_init_obj.boot_kb_outp_rep_handler = hids_boot_kb_outp_rep_handler;
-    hids_init_obj.pm_evt_handler = hids_pm_evt_handler;
 
     err = bt_hids_init(&hids_obj, &hids_init_obj);
     __ASSERT(err == 0, "HIDS initialization failed\n");
@@ -599,7 +489,7 @@ static int gamepad_report_send(struct bt_conn *conn, gamepad_event_state state)
     data[5] = state.thumbsticks.right.horizontal;
 
     err = bt_hids_inp_rep_send(&hids_obj, conn, INPUT_REP_GAMEPAD_IDX, data, sizeof(data), NULL);
-    
+
     return err;
 }
 
@@ -607,7 +497,7 @@ static int report_send(gamepad_event_state state)
 {
     for (size_t i = 0; i < CONFIG_BT_HIDS_MAX_CLIENT_COUNT; i++)
     {
-        if (conn_mode[i].conn)
+        if (conn_mode[i].conn && bt_conn_get_security(conn_mode[i].conn) == BT_SECURITY_L4)
         {
             int err;
             err = gamepad_report_send(conn_mode[i].conn, state);
@@ -622,16 +512,15 @@ static int report_send(gamepad_event_state state)
     return 0;
 }
 
-
-static int gamepad_button_changed(uint8_t button, bool down)
+static void gamepad_button_changed(uint8_t button, bool down)
 {
     hid_gamepad_state.buttons = (hid_gamepad_state.buttons & ~(1 << button)) | (down << button);
     data_to_send = true;
 }
 
-static int gamepad_thumbstick_changed(uint8_t thumbstick, uint8_t vertical, uint8_t horizontal)
+static void gamepad_thumbstick_changed(uint8_t thumbstick, uint8_t vertical, uint8_t horizontal)
 {
-    hid_gamepad_state.thumbsticks[thumbstick].vertical = 255-vertical;
+    hid_gamepad_state.thumbsticks[thumbstick].vertical = 255 - vertical;
     hid_gamepad_state.thumbsticks[thumbstick].horizontal = horizontal;
     data_to_send = true;
 }
@@ -642,7 +531,7 @@ static void gamepad_event_handler(struct k_work *work)
 
     while (!k_msgq_get(&hids_queue, &state, K_NO_WAIT))
     {
-		report_send(state);
+        report_send(state);
     }
 }
 
@@ -680,11 +569,11 @@ static void num_comp_reply(bool accept)
 static int add_to_queue(void)
 {
     int err;
-	
-	gamepad_event_state state = {};
-	
-    state.buttons.first = (uint8_t) hid_gamepad_state.buttons;
-    state.buttons.second = (uint8_t ) (hid_gamepad_state.buttons >> 8);
+
+    gamepad_event_state state;
+
+    state.buttons.first = (uint8_t)hid_gamepad_state.buttons;
+    state.buttons.second = (uint8_t)(hid_gamepad_state.buttons >> 8);
 
     state.thumbsticks.left.vertical = hid_gamepad_state.thumbsticks[0].vertical;
     state.thumbsticks.left.horizontal = hid_gamepad_state.thumbsticks[0].horizontal;
@@ -708,8 +597,6 @@ static int add_to_queue(void)
 
 static void button_changed(uint32_t button_state, uint32_t has_changed)
 {
-    int err;
-
     static bool pairing_button_pressed;
 
     uint32_t buttons = button_state & has_changed;
@@ -790,83 +677,74 @@ static void configure_gpio(void)
     }
 }
 
-static void bas_notify(void)
-{
-    uint8_t battery_level = bt_bas_get_battery_level();
-
-    battery_level--;
-
-    if (!battery_level)
-    {
-        battery_level = 100U;
-    }
-
-    bt_bas_set_battery_level(battery_level);
-}
-
 static int saadc_sample(void)
 {
-	int ret;
-	const struct adc_sequence sequence = {
-		.channels = 15,
-		.buffer = saadc_buffer,
-		.buffer_size = sizeof(saadc_buffer),
-		.resolution = ADC_RESOLUTION,
-	};
+    int ret;
+    const struct adc_sequence sequence = {
+        .channels = 15,
+        .buffer = saadc_buffer,
+        .buffer_size = sizeof(saadc_buffer),
+        .resolution = ADC_RESOLUTION,
+    };
 
-	if (!adc_dev) {
-		return -1;
-	}
+    if (!adc_dev)
+    {
+        return -1;
+    }
 
-	ret = adc_read(adc_dev, &sequence);
-	if (ret) {
+    ret = adc_read(adc_dev, &sequence);
+    if (ret)
+    {
         printk("adc_read() failed with code %d\n", ret);
-	}
+    }
 
-        printk("VERTICAL: %d, HORIZONTAL: %d\n", saadc_buffer[0] >= 0 ? saadc_buffer[0] : 0, saadc_buffer[1] >= 0 ? saadc_buffer[1] : 0);
-        gamepad_thumbstick_changed(0, saadc_buffer[0] >= 0 ? saadc_buffer[0] : 0 , saadc_buffer[1] >= 0 ? saadc_buffer[1] : 0);
-        gamepad_thumbstick_changed(1, saadc_buffer[2] >= 0 ? saadc_buffer[2] : 0 , saadc_buffer[3] >= 0 ? saadc_buffer[3] : 0);        
+    gamepad_thumbstick_changed(0, saadc_buffer[0] >= 0 ? saadc_buffer[0] : 0, saadc_buffer[1] >= 0 ? saadc_buffer[1] : 0);
+    gamepad_thumbstick_changed(1, saadc_buffer[2] >= 0 ? saadc_buffer[2] : 0, saadc_buffer[3] >= 0 ? saadc_buffer[3] : 0);
 
-        if (data_to_send)
-            add_to_queue();
+    if (data_to_send)
+        add_to_queue();
 
-	return ret;
+    return ret;
 }
 
-static void saadc_handler(struct k_work *work) {
+static void saadc_handler(struct k_work *work)
+{
     saadc_sample();
 }
 
-void adc_sample_event(struct k_timer *timer_id) {
+void adc_sample_event(struct k_timer *timer_id)
+{
     k_work_submit(&saadc_work);
 }
 
-void configure_saadc(void) {
+void configure_saadc(void)
+{
     int err;
-	
-	k_timer_init(&saadc_timer, adc_sample_event, NULL);
+
+    k_timer_init(&saadc_timer, adc_sample_event, NULL);
     k_timer_start(&saadc_timer, K_MSEC(SAADC_INTERVAL_MSEC), K_MSEC(SAADC_INTERVAL_MSEC));
 
     adc_dev = device_get_binding(ADC_DEVICE_NAME);
-	if (!adc_dev) {
+    if (!adc_dev)
+    {
         printk("device_get_binding ADC_0 (=%s) failed\n", ADC_DEVICE_NAME);
-    } 
-	
-	for (int i = 0; i < 4; i++)
-	{
-		const struct adc_channel_cfg saadc_channel_cfg = {
-			.gain = ADC_GAIN,
-			.reference = ADC_REFERENCE,
-			.acquisition_time = ADC_ACQUISITION_TIME,
-			.channel_id = i,
-			.input_positive = saadc_inputs[i]
-		};
-		
-		err = adc_channel_setup(adc_dev, &saadc_channel_cfg);
-		if (err) {
-			printk("Error in adc channel %d setup: %d\n", i, err);
-		}
-	}
+    }
+
+    for (int i = 0; i < 4; i++)
+    {
+        const struct adc_channel_cfg saadc_channel_cfg = {
+            .gain = ADC_GAIN,
+            .reference = ADC_REFERENCE,
+            .acquisition_time = ADC_ACQUISITION_TIME,
+            .channel_id = i,
+            .input_positive = saadc_inputs[i]};
+
+        err = adc_channel_setup(adc_dev, &saadc_channel_cfg);
+        if (err)
+        {
+            printk("Error in adc channel %d setup: %d\n", i, err);
+        }
+    }
 }
 
 void main(void)
@@ -894,9 +772,9 @@ void main(void)
     hid_init();
 
     k_work_queue_start(&hids_work_q, hids_stack, K_THREAD_STACK_SIZEOF(hids_stack), HIDS_PRIORITY, NULL);
-
     k_work_init(&hids_work, gamepad_event_handler);
-	k_work_init(&saadc_work, saadc_handler);
+
+    k_work_init(&saadc_work, saadc_handler);
     k_work_init(&pairing_work, pairing_process);
 
     if (IS_ENABLED(CONFIG_SETTINGS))
@@ -906,7 +784,6 @@ void main(void)
 
     advertising_start();
 
-
     for (;;)
     {
         if (is_adv)
@@ -915,10 +792,8 @@ void main(void)
         }
         else
         {
-			dk_set_led_off(ADV_STATUS_LED);
+            dk_set_led_off(ADV_STATUS_LED);
         }
         k_sleep(K_MSEC(ADV_LED_BLINK_INTERVAL));
-        /* battery level simulation */
-        bas_notify();
     }
 }
