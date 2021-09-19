@@ -5,6 +5,7 @@
 #include <sys/printk.h>
 #include <sys/byteorder.h>
 #include <zephyr.h>
+#include <device.h>
 #include <drivers/gpio.h>
 #include <soc.h>
 #include <assert.h>
@@ -22,6 +23,9 @@
 #include <bluetooth/services/hids.h>
 #include <bluetooth/services/dis.h>
 #include <dk_buttons_and_leds.h>
+
+#include <hal/nrf_saadc.h>
+#include <drivers/adc.h>
 
 #define DEVICE_NAME CONFIG_BT_DEVICE_NAME
 #define DEVICE_NAME_LEN (sizeof(DEVICE_NAME) - 1)
@@ -67,6 +71,15 @@
 
 #define INPUT_REPORT_GAMEPAD_BUTTONS_MAX_LEN 2
 #define INPUT_REPORT_GAMEPAD_THUMBSTICK_MAX_LEN 2
+
+#define ADC_DEVICE_NAME DT_LABEL(DT_INST(0, nordic_nrf_saadc))
+#define ADC_RESOLUTION 8
+#define ADC_GAIN ADC_GAIN_1_6
+#define ADC_REFERENCE ADC_REF_INTERNAL
+#define ADC_ACQUISITION_TIME ADC_ACQ_TIME(ADC_ACQ_TIME_MICROSECONDS, 10)
+
+#define SAADC_INTERVAL_MSEC 50
+#define BUFFER_SIZE 4
 
 /* OUT report internal indexes.
  *
@@ -152,6 +165,12 @@ struct pairing_data_mitm
     unsigned int passkey;
 };
 
+struct k_timer saadc_timer;
+const struct device *adc_dev;
+static struct k_work saadc_work;
+
+static nrf_saadc_input_t saadc_inputs[4] = {NRF_SAADC_INPUT_AIN0, NRF_SAADC_INPUT_AIN1, NRF_SAADC_INPUT_AIN2, NRF_SAADC_INPUT_AIN3};
+
 K_MSGQ_DEFINE(hids_buttons_queue,
               sizeof(buttons_state),
               HIDS_QUEUE_SIZE,
@@ -166,6 +185,8 @@ K_MSGQ_DEFINE(mitm_queue,
               sizeof(struct pairing_data_mitm),
               CONFIG_BT_HIDS_MAX_CLIENT_COUNT,
               4);
+
+static int16_t saadc_buffer[BUFFER_SIZE];
 
 static void advertising_start(void)
 {
@@ -590,7 +611,7 @@ static int gamepad_report_thumbstick_send(const struct gamepad_state *state, str
     int err = 0;
     uint8_t data[INPUT_REPORT_GAMEPAD_THUMBSTICK_MAX_LEN];
 
-    data[0] = thumbstick_state.horizontal;
+    data[0] = 255-thumbstick_state.horizontal;
     data[1] = thumbstick_state.vertical;
 
     err = bt_hids_inp_rep_send(&hids_obj, conn, INPUT_REP_GAMEPAD_LEFT_STICK_IDX + thumbstick_state.thumbstick, data, sizeof(data), NULL);
@@ -801,21 +822,6 @@ static void button_changed(uint32_t button_state, uint32_t has_changed)
         }
     }
 
-    data_to_send_thumbstick.left = false;
-    data_to_send_thumbstick.right = false;
-
-    for (int thumbstick = 0; thumbstick < 2; thumbstick++)
-    {
-        if (has_changed & BUTTON_A_MASK)
-            gamepad_thumbstick_changed_temp(thumbstick, 0, (button_state & BUTTON_A_MASK) != 0);
-        if (has_changed & BUTTON_B_MASK)
-            gamepad_thumbstick_changed_temp(thumbstick, 1, (button_state & BUTTON_B_MASK) != 0);
-        if (has_changed & BUTTON_X_MASK)
-            gamepad_thumbstick_changed_temp(thumbstick, 2, (button_state & BUTTON_X_MASK) != 0);
-        if (has_changed & BUTTON_Y_MASK)
-            gamepad_thumbstick_changed_temp(thumbstick, 3, (button_state & BUTTON_Y_MASK) != 0);
-    }
-
     data_to_send_buttons = false;
 
     if (has_changed & BUTTON_A_MASK)
@@ -850,17 +856,6 @@ static void button_changed(uint32_t button_state, uint32_t has_changed)
     if (has_changed & BUTTON_UP_MASK)
     {
         gamepad_button_changed(12, (button_state & BUTTON_UP_MASK) != 0);
-    }
-
-    // Define enum to make this better.
-    if (data_to_send_thumbstick.left)
-    {
-        add_to_thumbstick_queue(0);
-    }
-
-    if (data_to_send_thumbstick.right)
-    {
-        add_to_thumbstick_queue(1);
     }
 
     if (data_to_send_buttons)
@@ -900,6 +895,67 @@ static void bas_notify(void)
     bt_bas_set_battery_level(battery_level);
 }
 
+static int saadc_sample(void)
+{
+	int ret;
+	const struct adc_sequence sequence = {
+		.channels = 15,
+		.buffer = saadc_buffer,
+		.buffer_size = sizeof(saadc_buffer),
+		.resolution = ADC_RESOLUTION,
+	};
+
+	if (!adc_dev) {
+		return -1;
+	}
+
+	ret = adc_read(adc_dev, &sequence);
+	if (ret) {
+        printk("adc_read() failed with code %d\n", ret);
+	}
+
+        gamepad_thumbstick_changed(0, saadc_buffer[0] >= 0 ? saadc_buffer[0] : 0 , saadc_buffer[1] >= 0 ? saadc_buffer[1] : 0);
+        gamepad_thumbstick_changed(1, saadc_buffer[2] >= 0 ? saadc_buffer[2] : 0 , saadc_buffer[3] >= 0 ? saadc_buffer[3] : 0);        
+
+	return ret;
+}
+
+static void saadc_handler(struct k_work *work) {
+    saadc_sample();
+}
+
+void adc_sample_event(struct k_timer *timer_id) {
+    k_work_submit(&saadc_work);
+}
+
+void configure_saadc(void) {
+    int err;
+	
+	k_timer_init(&saadc_timer, adc_sample_event, NULL);
+    k_timer_start(&saadc_timer, K_MSEC(SAADC_INTERVAL_MSEC), K_MSEC(SAADC_INTERVAL_MSEC));
+
+    adc_dev = device_get_binding(ADC_DEVICE_NAME);
+	if (!adc_dev) {
+        printk("device_get_binding ADC_0 (=%s) failed\n", ADC_DEVICE_NAME);
+    } 
+	
+	for (int i = 0; i < 4; i++)
+	{
+		const struct adc_channel_cfg saadc_channel_cfg = {
+			.gain = ADC_GAIN,
+			.reference = ADC_REFERENCE,
+			.acquisition_time = ADC_ACQUISITION_TIME,
+			.channel_id = i,
+			.input_positive = saadc_inputs[i]
+		};
+		
+		err = adc_channel_setup(adc_dev, &saadc_channel_cfg);
+		if (err) {
+			printk("Error in adc channel %d setup: %d\n", i, err);
+		}
+	}
+}
+
 void main(void)
 {
     int err;
@@ -908,6 +964,7 @@ void main(void)
     printk("Initializing BLE HID Gamepad\n");
 
     configure_gpio();
+    configure_saadc();
 
     bt_conn_cb_register(&conn_callbacks);
     bt_conn_auth_cb_register(&conn_auth_callbacks);
@@ -925,6 +982,7 @@ void main(void)
 
     k_work_init(&hids_buttons_work, buttons_handler);
     k_work_init(&hids_thumbstick_work, thumbstick_handler);
+	k_work_init(&saadc_work, saadc_handler);
     k_work_init(&pairing_work, pairing_process);
 
     if (IS_ENABLED(CONFIG_SETTINGS))
@@ -943,10 +1001,10 @@ void main(void)
         }
         else
         {
-            dk_set_led_off(ADV_STATUS_LED);
+			dk_set_led_off(ADV_STATUS_LED);
         }
         k_sleep(K_MSEC(ADV_LED_BLINK_INTERVAL));
-        /* Battery level simulation */
+        /* battery level simulation */
         bas_notify();
     }
 }
