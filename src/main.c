@@ -63,10 +63,13 @@
 #define KEY_PAIRING_REJECT DK_BTN2_MSK
 
 /* HIDs queue elements. */
-#define HIDS_QUEUE_SIZE 1024
+#define HIDS_QUEUE_SIZE 50
 
 #define INPUT_REPORT_GAMEPAD_BUTTONS_MAX_LEN 2
 #define INPUT_REPORT_GAMEPAD_THUMBSTICK_MAX_LEN 2
+
+#define HIDS_STACK_SIZE 2048
+#define HIDS_PRIORITY 5
 
 /* OUT report internal indexes.
  *
@@ -93,7 +96,9 @@ enum
 /* HIDS instance. */
 BT_HIDS_DEF(hids_obj,
             OUTPUT_REPORT_MAX_LEN,
-            INPUT_REPORT_GAMEPAD_BUTTONS_MAX_LEN + 2 * INPUT_REPORT_GAMEPAD_THUMBSTICK_MAX_LEN); // Verify that this is the sum of all max lengths and not the largest report
+            INPUT_REPORT_GAMEPAD_BUTTONS_MAX_LEN,
+            INPUT_REPORT_GAMEPAD_THUMBSTICK_MAX_LEN,
+            INPUT_REPORT_GAMEPAD_THUMBSTICK_MAX_LEN);
 
 static volatile bool is_adv;
 
@@ -117,8 +122,18 @@ static struct conn_mode
     struct bt_conn *conn;
 } conn_mode[CONFIG_BT_HIDS_MAX_CLIENT_COUNT];
 
-static volatile bool data_to_buttons;
+static struct data_to_send_thumbsticks
+{
+    bool left;
+    bool right;
+} data_to_send_thumbstick;
+
+static volatile bool data_to_send_buttons;
 static struct k_work hids_work;
+
+K_THREAD_STACK_DEFINE(hids_stack, HIDS_STACK_SIZE);
+
+struct k_work_q hids_work_q;
 
 typedef enum
 {
@@ -129,9 +144,15 @@ typedef enum
 
 typedef struct
 {
-	element_type element;
-    uint8_t[2] element_state;
+    element_type element;
+    uint8_t element_state[2];
 } gamepad_element_state;
+
+typedef struct
+{
+    uint8_t horizontal;
+    uint8_t vertical;
+} thumbstick_state;
 
 static struct gamepad_state
 {
@@ -584,7 +605,7 @@ static int gamepad_report_thumbstick_send(struct bt_conn *conn, uint8_t thumbsti
     data[1] = horizontal;
 
     err = bt_hids_inp_rep_send(&hids_obj, conn, INPUT_REP_GAMEPAD_LEFT_STICK_IDX + thumbstick, data, sizeof(data), NULL);
-
+    
     return err;
 }
 
@@ -595,7 +616,6 @@ static int button_report_send(uint8_t buttons1, uint8_t buttons2)
         if (conn_mode[i].conn)
         {
             int err;
-
             err = gamepad_report_button_send(conn_mode[i].conn, buttons1, buttons2);
 
             if (err)
@@ -610,14 +630,11 @@ static int button_report_send(uint8_t buttons1, uint8_t buttons2)
 
 static int thumbstick_report_send(uint8_t thumbstick, uint8_t vertical, uint8_t horizontal)
 {
-	vertical = state.element_state[0];
-	horizontal = state.element_state[1];
     for (size_t i = 0; i < CONFIG_BT_HIDS_MAX_CLIENT_COUNT; i++)
     {
         if (conn_mode[i].conn)
         {
             int err;
-
             err = gamepad_report_thumbstick_send(conn_mode[i].conn, thumbstick, vertical, horizontal);
 
             if (err)
@@ -670,9 +687,9 @@ static void element_handler(struct k_work *work)
 {
     gamepad_element_state state;
 
-    while (!k_msgq_get(&hids_buttons_queue, &state, K_NO_WAIT))
+    while (!k_msgq_get(&hids_queue, &state, K_NO_WAIT))
     {
-		switch(state.element_type){
+		switch(state.element){
 			case BUTTONS: {
 				button_report_send(state.element_state[0], state.element_state[1]);				
 				break;
@@ -725,7 +742,7 @@ static int add_to_queue(element_type element)
     int err;
 	
 	gamepad_element_state element_state = {};
-	element_state.element_type = element;
+	element_state.element = element;
 	
 	switch(element) {
 		case BUTTONS: {
@@ -750,19 +767,16 @@ static int add_to_queue(element_type element)
     err = k_msgq_put(&hids_queue, &element_state, K_NO_WAIT);
     if (err)
     {
-        printk("No space in the queue for button pressed\n");
+        printk("No space in the queue for gamepad event\n");
         return err;
     }
-    if (k_msgq_num_used_get(&hids_queue) == 1)
-    {
-        k_work_submit(&hids_work);
-    }
-
     return 0;
 }
 
 static void button_changed(uint32_t button_state, uint32_t has_changed)
 {
+    int err;
+
     static bool pairing_button_pressed;
 
     uint32_t buttons = button_state & has_changed;
@@ -837,17 +851,24 @@ static void button_changed(uint32_t button_state, uint32_t has_changed)
         gamepad_button_changed(12, (button_state & BUTTON_UP_MASK) != 0);
     }
 
+    if (data_to_send_thumbstick.left)
+    {
+        add_to_queue(LEFT_THUMBSTICK);
+    } 
+    if (data_to_send_thumbstick.right)
+    {
+        add_to_queue(RIGHT_THUMBSTICK);
+    }
     if (data_to_send_buttons)
     {
         add_to_queue(BUTTONS);
     }
-	if (data_to_send_thumbstick.left)
-    {
-        add_to_queue(LEFT_THUMBSTICK);
-    }
-	if (data_to_send_thumbstick.right)
-    {
-        add_to_queue(RIGHT_THUMBSTICK);
+
+    if (data_to_send_thumbstick.left || data_to_send_thumbstick.right || data_to_send_buttons) {
+        if (k_msgq_num_used_get(&hids_queue) >= 1)
+        {
+            err = k_work_submit_to_queue(&hids_work_q, &hids_work);
+        }
     }
 }
 
@@ -904,6 +925,8 @@ void main(void)
     printk("Bluetooth initialized\n");
 
     hid_init();
+
+    k_work_queue_start(&hids_work_q, hids_stack, K_THREAD_STACK_SIZEOF(hids_stack), HIDS_PRIORITY, NULL);
 
     k_work_init(&hids_work, element_handler);
     k_work_init(&pairing_work, pairing_process);
