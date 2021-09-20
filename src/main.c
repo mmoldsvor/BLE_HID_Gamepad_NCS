@@ -46,6 +46,14 @@
 #define BUTTON_LEFT_MASK DK_BTN3_MSK
 #define BUTTON_UP_MASK DK_BTN1_MSK
 
+#define BUTTON_LEFT_TRIGGER_BUTTON_MASK DK_BTN1_MSK
+#define BUTTON_LEFT_BUMPER_MASK DK_BTN4_MSK
+#define BUTTON_RIGHT_TRIGGER_BUTTON_MASK DK_BTN4_MSK
+#define BUTTON_RIGHT_BUMPER_MASK DK_BTN1_MSK
+
+#define BUTTON_MINUS_MASK DK_BTN3_MSK
+#define BUTTON_PLUS_MASK DK_BTN2_MSK
+
 #define KEY_ADV_MASK DK_BTN4_MSK
 
 /* Key used to accept or reject passkey value */
@@ -53,7 +61,7 @@
 #define KEY_PAIRING_REJECT DK_BTN2_MSK
 
 /* HIDs queue elements. */
-#define HIDS_QUEUE_SIZE 50
+#define HIDS_QUEUE_SIZE 10
 
 #define INPUT_REP_GAMEPAD_REF_ID 1
 
@@ -64,13 +72,16 @@
 #define HIDS_STACK_SIZE 2048
 #define HIDS_PRIORITY 5
 
+#define SAADC_STACK_SIZE 2048
+#define SAADC_PRIORITY 10
+
 #define ADC_DEVICE_NAME DT_LABEL(DT_INST(0, nordic_nrf_saadc))
 #define ADC_RESOLUTION 8
 #define ADC_GAIN ADC_GAIN_1_6
 #define ADC_REFERENCE ADC_REF_INTERNAL
 #define ADC_ACQUISITION_TIME ADC_ACQ_TIME(ADC_ACQ_TIME_MICROSECONDS, 10)
 
-#define SAADC_INTERVAL_MSEC 50
+#define SAADC_INTERVAL_MSEC 10
 #define BUFFER_SIZE 4
 
 // Position in internal report table
@@ -162,6 +173,9 @@ K_MSGQ_DEFINE(hids_queue,
 
 K_THREAD_STACK_DEFINE(hids_stack, HIDS_STACK_SIZE);
 struct k_work_q hids_work_q;
+
+K_THREAD_STACK_DEFINE(saadc_stack, SAADC_STACK_SIZE);
+struct k_work_q saadc_work_q;
 
 static int16_t saadc_buffer[BUFFER_SIZE];
 
@@ -622,39 +636,41 @@ static void button_changed(uint32_t button_state, uint32_t has_changed)
 
     data_to_send = false;
 
+
+    // Button mapping in accordance with W3C (World Wide Web Consortium)
     if (has_changed & BUTTON_A_MASK)
-    {
         gamepad_button_changed(0, (button_state & BUTTON_A_MASK) != 0);
-    }
     if (has_changed & BUTTON_B_MASK)
-    {
         gamepad_button_changed(1, (button_state & BUTTON_B_MASK) != 0);
-    }
     if (has_changed & BUTTON_X_MASK)
-    {
         gamepad_button_changed(2, (button_state & BUTTON_X_MASK) != 0);
-    }
     if (has_changed & BUTTON_Y_MASK)
-    {
         gamepad_button_changed(3, (button_state & BUTTON_Y_MASK) != 0);
-    }
 
     if (has_changed & BUTTON_DOWN_MASK)
-    {
         gamepad_button_changed(13, (button_state & BUTTON_DOWN_MASK) != 0);
-    }
     if (has_changed & BUTTON_RIGHT_MASK)
-    {
         gamepad_button_changed(15, (button_state & BUTTON_RIGHT_MASK) != 0);
-    }
     if (has_changed & BUTTON_LEFT_MASK)
-    {
         gamepad_button_changed(14, (button_state & BUTTON_LEFT_MASK) != 0);
-    }
     if (has_changed & BUTTON_UP_MASK)
-    {
         gamepad_button_changed(12, (button_state & BUTTON_UP_MASK) != 0);
-    }
+
+    if (has_changed & BUTTON_LEFT_TRIGGER_BUTTON_MASK)
+        gamepad_button_changed(6, (button_state & BUTTON_LEFT_TRIGGER_BUTTON_MASK) != 0);
+    if (has_changed & BUTTON_LEFT_BUMPER_MASK)
+        gamepad_button_changed(4, (button_state & BUTTON_LEFT_BUMPER_MASK) != 0);
+
+    if (has_changed & BUTTON_RIGHT_TRIGGER_BUTTON_MASK)
+        gamepad_button_changed(7, (button_state & BUTTON_RIGHT_TRIGGER_BUTTON_MASK) != 0);
+    if (has_changed & BUTTON_RIGHT_BUMPER_MASK)
+        gamepad_button_changed(5, (button_state & BUTTON_RIGHT_BUMPER_MASK) != 0);
+
+    if (has_changed & BUTTON_MINUS_MASK)
+        gamepad_button_changed(8, (button_state & BUTTON_LEFT_MASK) != 0);
+    if (has_changed & BUTTON_PLUS_MASK)
+        gamepad_button_changed(9, (button_state & BUTTON_RIGHT_MASK) != 0);
+
 
     if (data_to_send)
         add_to_queue();
@@ -714,7 +730,7 @@ static void saadc_handler(struct k_work *work)
 
 void adc_sample_event(struct k_timer *timer_id)
 {
-    k_work_submit(&saadc_work);
+    k_work_submit_to_queue(&saadc_work_q, &saadc_work);
 }
 
 void configure_saadc(void)
@@ -773,8 +789,10 @@ void main(void)
 
     k_work_queue_start(&hids_work_q, hids_stack, K_THREAD_STACK_SIZEOF(hids_stack), HIDS_PRIORITY, NULL);
     k_work_init(&hids_work, gamepad_event_handler);
-
+    
+    k_work_queue_start(&saadc_work_q, saadc_stack, K_THREAD_STACK_SIZEOF(saadc_stack), SAADC_PRIORITY, NULL);
     k_work_init(&saadc_work, saadc_handler);
+
     k_work_init(&pairing_work, pairing_process);
 
     if (IS_ENABLED(CONFIG_SETTINGS))
