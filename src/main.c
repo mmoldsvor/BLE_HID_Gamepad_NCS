@@ -21,7 +21,6 @@
 
 #include <bluetooth/services/hids.h>
 #include <bluetooth/services/dis.h>
-#include <dk_buttons_and_leds.h>
 
 #include <hal/nrf_saadc.h>
 #include <drivers/adc.h>
@@ -33,32 +32,36 @@
 
 #define ADV_LED_BLINK_INTERVAL 1000
 
-#define ADV_STATUS_LED DK_LED1
-#define CON_STATUS_LED DK_LED2
+#define ADV_STATUS_LED 11
+#define CON_STATUS_LED 12
 
-#define BUTTON_A_MASK DK_BTN4_MSK
-#define BUTTON_B_MASK DK_BTN2_MSK
-#define BUTTON_X_MASK DK_BTN3_MSK
-#define BUTTON_Y_MASK DK_BTN1_MSK
+#define BUTTON_X_MASK BIT(6)
+#define BUTTON_Y_MASK BIT(5)
+#define BUTTON_A_MASK BIT(7)
+#define BUTTON_B_MASK BIT(4)
 
-#define BUTTON_DOWN_MASK DK_BTN4_MSK
-#define BUTTON_RIGHT_MASK DK_BTN2_MSK
-#define BUTTON_LEFT_MASK DK_BTN3_MSK
-#define BUTTON_UP_MASK DK_BTN1_MSK
+#define BUTTON_DOWN_MASK BIT(19)
+#define BUTTON_RIGHT_MASK BIT(18)
+#define BUTTON_LEFT_MASK BIT(20)
+#define BUTTON_UP_MASK BIT(21)
 
-#define BUTTON_LEFT_TRIGGER_BUTTON_MASK DK_BTN1_MSK
-#define BUTTON_LEFT_BUMPER_MASK DK_BTN4_MSK
-#define BUTTON_RIGHT_TRIGGER_BUTTON_MASK DK_BTN4_MSK
-#define BUTTON_RIGHT_BUMPER_MASK DK_BTN1_MSK
+#define BUTTON_HOME_MASK BIT(13)
+#define BUTTON_MINUS_MASK BIT(14)
+#define BUTTON_PLUS_MASK BIT(10)
 
-#define BUTTON_MINUS_MASK DK_BTN3_MSK
-#define BUTTON_PLUS_MASK DK_BTN2_MSK
+#define BUTTON_LEFT_TRIGGER_BUTTON_MASK BIT(24)
+#define BUTTON_LEFT_BUMPER_MASK BIT(23)
+#define BUTTON_RIGHT_TRIGGER_BUTTON_MASK BIT(26)
+#define BUTTON_RIGHT_BUMPER_MASK BIT(25)
 
-#define KEY_ADV_MASK DK_BTN4_MSK
+#define BUTTON_LEFT_STICK_BUTTON_MASK BIT(15)
+#define BUTTON_RIGHT_STICK_BUTTON_MASK BIT(16)
+
+#define KEY_ADV_MASK BIT(13)
 
 /* Key used to accept or reject passkey value */
-#define KEY_PAIRING_ACCEPT DK_BTN1_MSK
-#define KEY_PAIRING_REJECT DK_BTN2_MSK
+#define KEY_PAIRING_ACCEPT BIT(10)
+#define KEY_PAIRING_REJECT BIT(14)
 
 /* HIDs queue elements. */
 #define HIDS_QUEUE_SIZE 10
@@ -77,12 +80,12 @@
 
 #define ADC_DEVICE_NAME DT_LABEL(DT_INST(0, nordic_nrf_saadc))
 #define ADC_RESOLUTION 8
-#define ADC_GAIN ADC_GAIN_1_6
-#define ADC_REFERENCE ADC_REF_INTERNAL
+#define ADC_GAIN ADC_GAIN_1_4
+#define ADC_REFERENCE ADC_REF_VDD_1_4
 #define ADC_ACQUISITION_TIME ADC_ACQ_TIME(ADC_ACQ_TIME_MICROSECONDS, 10)
 
-#define SAADC_INTERVAL_MSEC 10
-#define BUFFER_SIZE 4
+#define SAADC_INTERVAL_MSEC 15
+#define BUFFER_SIZE 8
 
 // Position in internal report table
 enum
@@ -148,15 +151,18 @@ struct pairing_data_mitm
     unsigned int passkey;
 };
 
+static struct k_work num_comp_reply_work;
+static bool num_comp_reply_value;
+
 const struct device *adc_dev;
 struct k_timer saadc_timer;
 static struct k_work saadc_work;
 
 static nrf_saadc_input_t saadc_inputs[4] = {
-    NRF_SAADC_INPUT_AIN2,  // Left thumbstick vertical
-    NRF_SAADC_INPUT_AIN3,  // Left thumbstick horizontal
-    NRF_SAADC_INPUT_AIN0,  // Right thumbstick vertical
-    NRF_SAADC_INPUT_AIN1}; // Right thumbstick horizontal
+    NRF_SAADC_INPUT_AIN1,  // Left thumbstick vertical
+    NRF_SAADC_INPUT_AIN0,  // Left thumbstick horizontal
+    NRF_SAADC_INPUT_AIN6,  // Right thumbstick vertical
+    NRF_SAADC_INPUT_AIN7}; // Right thumbstick horizontal
 
 K_MSGQ_DEFINE(mitm_queue,
               sizeof(struct pairing_data_mitm),
@@ -184,6 +190,32 @@ static struct gamepad_state
     uint32_t buttons;
     thumbstick_state thumbsticks[2];
 } hid_gamepad_state;
+
+static struct gpio_callback button_cb_data;
+
+static const struct gpio_dt_spec button[] = {
+    GPIO_DT_SPEC_GET(DT_ALIAS(sw0), gpios),
+    GPIO_DT_SPEC_GET(DT_ALIAS(sw1), gpios),
+    GPIO_DT_SPEC_GET(DT_ALIAS(sw2), gpios),
+    GPIO_DT_SPEC_GET(DT_ALIAS(sw3), gpios),
+    GPIO_DT_SPEC_GET(DT_ALIAS(sw4), gpios),
+    GPIO_DT_SPEC_GET(DT_ALIAS(sw5), gpios),
+    GPIO_DT_SPEC_GET(DT_ALIAS(sw6), gpios),
+    GPIO_DT_SPEC_GET(DT_ALIAS(sw7), gpios),
+    GPIO_DT_SPEC_GET(DT_ALIAS(sw8), gpios),
+    GPIO_DT_SPEC_GET(DT_ALIAS(sw9), gpios),
+    GPIO_DT_SPEC_GET(DT_ALIAS(sw10), gpios),
+    GPIO_DT_SPEC_GET(DT_ALIAS(sw11), gpios),
+    GPIO_DT_SPEC_GET(DT_ALIAS(sw12), gpios),
+    GPIO_DT_SPEC_GET(DT_ALIAS(sw13), gpios),
+    GPIO_DT_SPEC_GET(DT_ALIAS(sw14), gpios),
+    GPIO_DT_SPEC_GET(DT_ALIAS(sw15), gpios),
+};
+
+static const struct gpio_dt_spec led[] = {
+    GPIO_DT_SPEC_GET(DT_ALIAS(led0), gpios),
+    GPIO_DT_SPEC_GET(DT_ALIAS(led1), gpios),
+};
 
 static void advertising_start(void)
 {
@@ -248,7 +280,7 @@ static void connected(struct bt_conn *conn, uint8_t err)
     }
 
     printk("Connected %s\n", addr);
-    dk_set_led_on(CON_STATUS_LED);
+    gpio_pin_set_raw(led[0].port, CON_STATUS_LED, 1);
 
     err = bt_hids_connected(&hids_obj, conn);
 
@@ -304,7 +336,7 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
 
     if (!is_any_dev_connected)
     {
-        dk_set_led_off(CON_STATUS_LED);
+        gpio_pin_set_raw(led[0].port, CON_STATUS_LED, 0);
     }
 
     advertising_start();
@@ -328,10 +360,17 @@ static void security_changed(struct bt_conn *conn, bt_security_t level,
     }
 }
 
+static void le_param_updated(struct bt_conn *conn, uint16_t interval, 
+                              uint16_t latency, uint16_t timeout)
+{
+    printk("INTERVAL: %d\n", interval);
+}
+
 static struct bt_conn_cb conn_callbacks = {
     .connected = connected,
     .disconnected = disconnected,
     .security_changed = security_changed,
+    .le_param_updated = le_param_updated,
 };
 
 static void hid_init(void)
@@ -490,6 +529,44 @@ static struct bt_conn_auth_cb conn_auth_callbacks = {
     .pairing_complete = pairing_complete,
     .pairing_failed = pairing_failed};
 
+static void num_comp_reply(bool accept)
+{
+    struct pairing_data_mitm pairing_data;
+    struct bt_conn *conn;
+
+    if (k_msgq_get(&mitm_queue, &pairing_data, K_NO_WAIT) != 0)
+    {
+        return;
+    }
+
+    conn = pairing_data.conn;
+
+    if (accept)
+    {
+        bt_conn_auth_passkey_confirm(conn);
+        printk("Numeric Match, conn %p\n", conn);
+    }
+    else
+    {
+        bt_conn_auth_cancel(conn);
+        printk("Numeric Reject, conn %p\n", conn);
+    }
+
+    bt_conn_unref(pairing_data.conn);
+
+    if (k_msgq_num_used_get(&mitm_queue))
+    {
+        k_work_submit(&pairing_work);
+    }
+}
+
+static void num_comp_reply_handler(struct k_work *work)
+{
+    int err;
+
+    num_comp_reply(num_comp_reply_value);
+}
+
 static int gamepad_report_send(struct bt_conn *conn, gamepad_event_state state)
 {
     int err = 0;
@@ -549,37 +626,6 @@ static void gamepad_event_handler(struct k_work *work)
     }
 }
 
-static void num_comp_reply(bool accept)
-{
-    struct pairing_data_mitm pairing_data;
-    struct bt_conn *conn;
-
-    if (k_msgq_get(&mitm_queue, &pairing_data, K_NO_WAIT) != 0)
-    {
-        return;
-    }
-
-    conn = pairing_data.conn;
-
-    if (accept)
-    {
-        bt_conn_auth_passkey_confirm(conn);
-        printk("Numeric Match, conn %p\n", conn);
-    }
-    else
-    {
-        bt_conn_auth_cancel(conn);
-        printk("Numeric Reject, conn %p\n", conn);
-    }
-
-    bt_conn_unref(pairing_data.conn);
-
-    if (k_msgq_num_used_get(&mitm_queue))
-    {
-        k_work_submit(&pairing_work);
-    }
-}
-
 static int add_to_queue(void)
 {
     int err;
@@ -620,7 +666,8 @@ static void button_changed(uint32_t button_state, uint32_t has_changed)
         if (buttons & KEY_PAIRING_ACCEPT)
         {
             pairing_button_pressed = true;
-            num_comp_reply(true);
+            num_comp_reply_value = 1;
+            k_work_submit(&num_comp_reply_work);
 
             return;
         }
@@ -628,7 +675,8 @@ static void button_changed(uint32_t button_state, uint32_t has_changed)
         if (buttons & KEY_PAIRING_REJECT)
         {
             pairing_button_pressed = true;
-            num_comp_reply(false);
+            num_comp_reply_value = 0;
+            k_work_submit(&num_comp_reply_work);
 
             return;
         }
@@ -636,16 +684,15 @@ static void button_changed(uint32_t button_state, uint32_t has_changed)
 
     data_to_send = false;
 
-
     // Button mapping in accordance with W3C (World Wide Web Consortium)
-    if (has_changed & BUTTON_A_MASK)
-        gamepad_button_changed(0, (button_state & BUTTON_A_MASK) != 0);
-    if (has_changed & BUTTON_B_MASK)
-        gamepad_button_changed(1, (button_state & BUTTON_B_MASK) != 0);
     if (has_changed & BUTTON_X_MASK)
-        gamepad_button_changed(2, (button_state & BUTTON_X_MASK) != 0);
+        gamepad_button_changed(0, (button_state & BUTTON_X_MASK) != 0);
     if (has_changed & BUTTON_Y_MASK)
-        gamepad_button_changed(3, (button_state & BUTTON_Y_MASK) != 0);
+        gamepad_button_changed(1, (button_state & BUTTON_Y_MASK) != 0);
+    if (has_changed & BUTTON_A_MASK)
+        gamepad_button_changed(2, (button_state & BUTTON_A_MASK) != 0);
+    if (has_changed & BUTTON_B_MASK)
+        gamepad_button_changed(3, (button_state & BUTTON_B_MASK) != 0);
 
     if (has_changed & BUTTON_DOWN_MASK)
         gamepad_button_changed(13, (button_state & BUTTON_DOWN_MASK) != 0);
@@ -666,31 +713,19 @@ static void button_changed(uint32_t button_state, uint32_t has_changed)
     if (has_changed & BUTTON_RIGHT_BUMPER_MASK)
         gamepad_button_changed(5, (button_state & BUTTON_RIGHT_BUMPER_MASK) != 0);
 
+    if (has_changed & BUTTON_LEFT_STICK_BUTTON_MASK)
+        gamepad_button_changed(10, (button_state & BUTTON_LEFT_STICK_BUTTON_MASK) != 0);
+    if (has_changed & BUTTON_RIGHT_STICK_BUTTON_MASK)
+        gamepad_button_changed(11, (button_state & BUTTON_RIGHT_STICK_BUTTON_MASK) != 0);
+
     if (has_changed & BUTTON_MINUS_MASK)
-        gamepad_button_changed(8, (button_state & BUTTON_LEFT_MASK) != 0);
+        gamepad_button_changed(8, (button_state & BUTTON_MINUS_MASK) != 0);
     if (has_changed & BUTTON_PLUS_MASK)
-        gamepad_button_changed(9, (button_state & BUTTON_RIGHT_MASK) != 0);
+        gamepad_button_changed(9, (button_state & BUTTON_PLUS_MASK) != 0);
 
 
     if (data_to_send)
         add_to_queue();
-}
-
-static void configure_gpio(void)
-{
-    int err;
-
-    err = dk_buttons_init(button_changed);
-    if (err)
-    {
-        printk("Cannot init buttons (err: %d)\n", err);
-    }
-
-    err = dk_leds_init();
-    if (err)
-    {
-        printk("Cannot init LEDs (err: %d)\n", err);
-    }
 }
 
 static int saadc_sample(void)
@@ -763,6 +798,40 @@ void configure_saadc(void)
     }
 }
 
+void button_pressed(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
+{
+        int ret = 0;
+
+	uint32_t pin_mask = 0;
+        gpio_port_value_t pin_values;
+        for (int i = 0; i < 32; i++)
+        {
+            if (pins & (1 << i))
+            {
+                ret = gpio_port_get_raw(dev, &pin_values);
+            }
+        }
+        button_changed(~pin_values, pins);
+}
+
+void configure_gpio(void) 
+{
+    int ret;
+
+    gpio_port_pins_t pin_mask = 0;
+    for (int i = 0; i < 16; i++) {
+        pin_mask |= BIT(button[i].pin);
+        ret = gpio_pin_configure_dt(&button[i], GPIO_INPUT);
+        ret = gpio_pin_interrupt_configure_dt(&button[i], GPIO_INT_EDGE_BOTH);
+    }
+    gpio_init_callback(&button_cb_data, button_pressed, pin_mask);
+    gpio_add_callback(button[0].port, &button_cb_data);
+
+    for (int i = 0; i < 2; i++)
+        ret = gpio_pin_configure_dt(&led[i], GPIO_OUTPUT);
+}
+
+
 void main(void)
 {
     int err;
@@ -794,6 +863,7 @@ void main(void)
     k_work_init(&saadc_work, saadc_handler);
 
     k_work_init(&pairing_work, pairing_process);
+    k_work_init(&num_comp_reply_work, num_comp_reply_handler);
 
     if (IS_ENABLED(CONFIG_SETTINGS))
     {
@@ -806,11 +876,12 @@ void main(void)
     {
         if (is_adv)
         {
-            dk_set_led(ADV_STATUS_LED, (++blink_status) % 2);
+            gpio_pin_set_raw(led[0].port, ADV_STATUS_LED, (++blink_status) % 2);
+            printk("Blink_status: %d\n", blink_status % 2);
         }
         else
         {
-            dk_set_led_off(ADV_STATUS_LED);
+            gpio_pin_set_raw(led[0].port, ADV_STATUS_LED, 0);
         }
         k_sleep(K_MSEC(ADV_LED_BLINK_INTERVAL));
     }
